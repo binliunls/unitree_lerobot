@@ -288,7 +288,6 @@ def populate_dataset(
     json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
-
         state = episode["state"]
         action = episode["action"]
         cameras = episode["cameras"]

@@ -467,6 +467,34 @@ LIFT_G1_DEX1_NOUSEWAIST_CONFIG = RobotConfig(
     json_action_data_name=["left_arm.qpos", "right_arm.qpos", "torso.qvel", "left_ee.qpos", "right_ee.qpos"],
 )
 
+H2_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristyaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+    ],
+    cameras=[
+        "cam_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ],
+    camera_to_image_key={"color_0": "cam_high", "color_1": "cam_left_wrist", "color_2": "cam_right_wrist"},
+    json_state_data_name=["left_arm.qpos", "right_arm.qpos"],
+    json_action_data_name=["left_arm.qpos", "right_arm.qpos"],
+)
+
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -479,4 +507,5 @@ ROBOT_CONFIGS = {
     "Unitree_G1_MoveibleLift_Dex1_NoUseWaist": MOVEIBLE_LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
+    "Unitree_H2": H2_CONFIG,
 }

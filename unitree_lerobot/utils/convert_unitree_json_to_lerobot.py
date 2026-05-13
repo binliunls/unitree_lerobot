@@ -137,6 +137,8 @@ class JsonDataset:
 
         images = defaultdict(list)
 
+        if not episode_data.get("data"):
+            return images
         keys = episode_data["data"][0]["colors"].keys()
         cameras = [key for key in keys if "depth" not in key]
 
@@ -287,12 +289,20 @@ def populate_dataset(
 ) -> LeRobotDataset:
     json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
-        episode = json_dataset.get_item(i)
+        try:
+            episode = json_dataset.get_item(i)
+        except (IndexError, StopIteration, ValueError) as e:
+            print(f"  [skip] episode {i} unreadable ({type(e).__name__}: {e})")
+            continue
         state = episode["state"]
         action = episode["action"]
         cameras = episode["cameras"]
         task = episode["task"]
         episode_length = episode["episode_length"]
+
+        if episode_length == 0 or not cameras:
+            print(f"  [skip] episode {i} has no frames (data: 0, cameras: {bool(cameras)})")
+            continue
 
         num_frames = episode_length
         for i in range(num_frames):

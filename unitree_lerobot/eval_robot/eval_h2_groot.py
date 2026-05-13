@@ -13,8 +13,8 @@ This script runs in the tv conda environment (no gr00t package required).
 It communicates via ZMQ using the same msgpack wire format as GR00T's
 PolicyServer / PolicyClient.
 
-Observation keys sent to the server (from training modality config):
-    video.high              (H, W, 3) uint8
+Observation keys sent to the server (single-eye head mode, default):
+    video.high              (H, W, 3) uint8   ← chosen head eye (left or right)
     video.left_wrist_view   (H, W, 3) uint8
     video.right_wrist_view  (H, W, 3) uint8
     state.left_arm          (7,)  float32
@@ -23,22 +23,42 @@ Observation keys sent to the server (from training modality config):
     state.right_hand        (22,) float32
     language.annotation.human.task_description  str
 
-Action chunk returned by the server (keys depend on training config):
+Stereo head mode (`--head-eye both`):
+    video.left_eye_view     (H, W, 3) uint8
+    video.right_eye_view    (H, W, 3) uint8
+    (plus wrists and state as above)
+
+Action chunk returned by the server:
     left_arm   (B, T, 7)
     right_arm  (B, T, 7)
     left_hand  (B, T, 22)
     right_hand (B, T, 22)
 
+Image source: ROS 2 (CycloneDDS) on the four sensing_h2_ros_gstreamer topics,
+or the legacy ZMQ teleimager server via `--image-source zmq`.
+
+Hand control: through the C++ sharpa_dds_bridge on Thor (default), or the
+direct Sharpa SDK on the local machine via `--hands-source sdk`.
+
 Usage:
+    # Standing replay, ROS cameras, DDS bridge for hands:
     python unitree_lerobot/eval_robot/eval_h2_groot.py \\
         --policy-host localhost --policy-port 5555 \\
         --task "pick up the apple" \\
-        --img-server-ip 192.168.124.162
+        --motion
 
-    # arm only (no Sharpa hardware)
+    # Right-eye only as video.high:
+    python unitree_lerobot/eval_robot/eval_h2_groot.py \\
+        --policy-host localhost --task "..." --head-eye right
+
+    # Stereo head (video.left_eye_view + video.right_eye_view):
+    python unitree_lerobot/eval_robot/eval_h2_groot.py \\
+        --policy-host localhost --task "..." --head-eye both
+
+    # Arm only (no hands), legacy ZMQ image server:
     python unitree_lerobot/eval_robot/eval_h2_groot.py \\
         --policy-host localhost --no-hands \\
-        --task "pick up the apple"
+        --image-source zmq --img-server-ip 192.168.124.162
 """
 
 import argparse
@@ -54,7 +74,7 @@ import numpy as np
 # ── paths ─────────────────────────────────────────────────────────────────────
 _REPO_ROOT  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _XR_ROOT    = os.path.expanduser("~/binliu/xr_teleoperate")
-_SHARPA_SDK = os.path.expanduser("~/Sharpa/SharpaWaveSDK_4.6.6/python")
+_SHARPA_SDK = os.environ.get("SHARPA_SDK_PATH", "/usr/lib/sharpa-wave-sdk/python")
 
 for p in [_REPO_ROOT, _XR_ROOT]:
     if p not in sys.path:
@@ -223,15 +243,41 @@ def disconnect_hand(hand, side: str):
 
 
 def read_hand_state(hand) -> np.ndarray:
+    """Read 22 joint angles (radians) from either the SDK SharpaWave or the DDS client."""
     if hand is None:
         return np.zeros(SHARPA_DOF, dtype=np.float32)
     try:
         err, angles_deg = hand.get_joint_position_degree()
-        if err.code != 0:
+        # SDK returns an Error obj with .code; DDS client returns a plain int.
+        code = getattr(err, "code", err)
+        if code != 0:
             return np.zeros(SHARPA_DOF, dtype=np.float32)
         return np.array([math.radians(a) for a in angles_deg[:SHARPA_DOF]], dtype=np.float32)
     except Exception:
         return np.zeros(SHARPA_DOF, dtype=np.float32)
+
+
+# ── Sharpa hand helpers — DDS bridge path ────────────────────────────────────
+
+def connect_hand_dds(side: str):
+    """Construct a SharpaHandDDSClient that talks to the C++ bridge on Thor."""
+    from teleop.robot_control.robot_hand_sharpa_dds import SharpaHandDDSClient
+    logger.info(f"[{side}] creating DDS client (bridge on Thor must be running)...")
+    client = SharpaHandDDSClient(side)
+    client.set_joint_position([0.0] * SHARPA_DOF, False)
+    logger.info(f"[{side}] DDS client ready.")
+    return client
+
+
+def disconnect_hand_dds(client, side: str):
+    if client is None:
+        return
+    try:
+        client.go_neutral()
+        time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"[{side}] DDS go_neutral error: {e}")
+    logger.info(f"[{side}] DDS client released.")
 
 
 # ── home / countdown helpers (mirrors replay_episode.py) ─────────────────────
@@ -254,6 +300,75 @@ def _go_home(arm_ctrl, left_hand, right_hand, hold_s: int):
     _countdown(hold_s, "holding home")
 
 
+# ── camera client factory ────────────────────────────────────────────────────
+
+def _make_image_client(args):
+    """Build a camera client (ROS or ZMQ) and return (client, cam_config)."""
+    if args.image_source == "ros":
+        from teleop.utils.ros_image_client import ROSImageClient
+        client = ROSImageClient(warmup_timeout=args.cam_warmup_s)
+        cam_config = client.get_cam_config()
+        logger.info("Camera client: ROS 2 (CycloneDDS)")
+    else:
+        from teleimager.image_client import ImageClient
+        client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        cam_config = client.get_cam_config()
+        logger.info(f"Camera client: ZMQ teleimager at {args.img_server_ip}")
+    return client, cam_config
+
+
+def _warm_cameras(img_client, timeout_s: float = 5.0):
+    """Poll all four getters until each returns a non-None bgr or timeout."""
+    getters = [
+        ("head",        img_client.get_head_frame),
+        ("left_wrist",  img_client.get_left_wrist_frame),
+        ("right_wrist", img_client.get_right_wrist_frame),
+    ]
+    deadline = time.perf_counter() + timeout_s
+    warmed = set()
+    while len(warmed) < len(getters) and time.perf_counter() < deadline:
+        for name, getter in getters:
+            if name in warmed:
+                continue
+            f = getter()
+            if f is not None and getattr(f, "bgr", None) is not None:
+                warmed.add(name)
+        if len(warmed) < len(getters):
+            time.sleep(0.05)
+    logger.info(f"Cameras warmed: {sorted(warmed)} ({len(warmed)}/{len(getters)})")
+
+
+# ── hand setup / teardown ────────────────────────────────────────────────────
+
+def _setup_hands(args):
+    """Connect both hands via the chosen source. Returns (left, right)."""
+    if not args.hands:
+        return None, None
+
+    if args.hands_source == "dds":
+        logger.info("Connecting hands via DDS bridge...")
+        left  = connect_hand_dds("left")
+        right = connect_hand_dds("right")
+    else:
+        logger.info("Connecting hands via direct Sharpa SDK...")
+        left  = connect_hand("left",  args.hand_speed_coeff, args.hand_current_coeff)
+        right = connect_hand("right", args.hand_speed_coeff, args.hand_current_coeff)
+    logger.info("Waiting for hands to reach neutral...")
+    time.sleep(2.0)
+    return left, right
+
+
+def _teardown_hands(args, left_hand, right_hand):
+    if not args.hands:
+        return
+    if args.hands_source == "dds":
+        disconnect_hand_dds(left_hand,  "left")
+        disconnect_hand_dds(right_hand, "right")
+    else:
+        disconnect_hand(left_hand,  "left")
+        disconnect_hand(right_hand, "right")
+
+
 # ── observation helpers ───────────────────────────────────────────────────────
 
 def _add_bt_dims(obs: dict) -> dict:
@@ -272,30 +387,60 @@ def _add_bt_dims(obs: dict) -> dict:
     return out
 
 
-def get_observations(img_client, arm_ctrl, left_hand, right_hand, cam_config, task: str) -> dict:
-    """Build the nested GR00T observation dict (before adding batch/time dims)."""
-    cam_name_to_key = {
-        "head_camera":        "high",
-        "left_wrist_camera":  "left_wrist_view",
-        "right_wrist_camera": "right_wrist_view",
-    }
-    getter_map = {
-        "high":            img_client.get_head_frame,
-        "left_wrist_view": img_client.get_left_wrist_frame,
-        "right_wrist_view": img_client.get_right_wrist_frame,
-    }
+def _split_head_image(stitched: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """ROSImageClient.get_head_frame() returns a (H, 2W, 3) horizontally-stitched
+    stereo image. Split it back into (left_eye, right_eye)."""
+    if stitched is None:
+        return None, None
+    w = stitched.shape[1] // 2
+    return stitched[:, :w, :], stitched[:, w:, :]
 
-    video = {}
-    for cam_name, cfg in cam_config.items():
-        if not cfg.get("enable_zmq"):
-            continue
-        key    = cam_name_to_key.get(cam_name)
-        getter = getter_map.get(key)
-        if key is None or getter is None:
-            continue
-        frame = getter()
-        if frame is not None and frame.bgr is not None:
-            video[key] = frame.bgr[:, :, ::-1].copy()   # BGR→RGB, uint8 (H,W,3)
+
+def get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                     cam_config, task: str, head_eye: str = "left",
+                     image_source: str = "ros") -> dict:
+    """Build the nested GR00T observation dict (before adding batch/time dims)."""
+    video: dict[str, np.ndarray] = {}
+
+    if image_source == "ros":
+        head_frame  = img_client.get_head_frame()
+        l_wrist     = img_client.get_left_wrist_frame()
+        r_wrist     = img_client.get_right_wrist_frame()
+
+        if head_frame is not None and head_frame.bgr is not None:
+            left_eye, right_eye = _split_head_image(head_frame.bgr)
+            if head_eye == "left":
+                video["high"] = left_eye[:, :, ::-1].copy()
+            elif head_eye == "right":
+                video["high"] = right_eye[:, :, ::-1].copy()
+            else:  # both
+                video["left_eye_view"]  = left_eye[:, :, ::-1].copy()
+                video["right_eye_view"] = right_eye[:, :, ::-1].copy()
+        if l_wrist is not None and l_wrist.bgr is not None:
+            video["left_wrist_view"]  = l_wrist.bgr[:, :, ::-1].copy()
+        if r_wrist is not None and r_wrist.bgr is not None:
+            video["right_wrist_view"] = r_wrist.bgr[:, :, ::-1].copy()
+    else:  # legacy ZMQ teleimager
+        cam_name_to_key = {
+            "head_camera":        "high",
+            "left_wrist_camera":  "left_wrist_view",
+            "right_wrist_camera": "right_wrist_view",
+        }
+        getter_map = {
+            "high":             img_client.get_head_frame,
+            "left_wrist_view":  img_client.get_left_wrist_frame,
+            "right_wrist_view": img_client.get_right_wrist_frame,
+        }
+        for cam_name, cfg in cam_config.items():
+            if not cfg.get("enable_zmq"):
+                continue
+            key    = cam_name_to_key.get(cam_name)
+            getter = getter_map.get(key) if key else None
+            if getter is None:
+                continue
+            frame = getter()
+            if frame is not None and frame.bgr is not None:
+                video[key] = frame.bgr[:, :, ::-1].copy()
 
     arm_q = arm_ctrl.get_current_dual_arm_q().astype(np.float32)
     state = {
@@ -320,93 +465,43 @@ def check_observations(args):
     Build one full observation dict (exactly as sent to the GR00T server) and
     print every field's key path, shape, dtype, and value range.
     Camera snapshots are saved to /tmp/check_<key>.png for visual inspection.
-    Requires arm and image server; hands are optional.
     """
     import cv2
 
-    # ── hands ─────────────────────────────────────────────────────────────────
-    left_hand  = None
-    right_hand = None
-    if args.hands:
-        logger.info("Connecting left hand...")
-        left_hand  = connect_hand("left",  args.hand_speed_coeff, args.hand_current_coeff)
-        logger.info("Connecting right hand...")
-        right_hand = connect_hand("right", args.hand_speed_coeff, args.hand_current_coeff)
-        time.sleep(2.0)
+    # DDS factory: needed for arm and for DDS-bridge hand client.
+    need_dds = args.arm or (args.hands and args.hands_source == "dds") \
+        or args.image_source == "ros"  # ROSImageClient uses CycloneDDS too
+    if args.arm or (args.hands and args.hands_source == "dds"):
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(args.dds_domain)
+        logger.info(f"DDS ChannelFactory initialised on domain {args.dds_domain}.")
 
-    # ── arm ───────────────────────────────────────────────────────────────────
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    ChannelFactoryInitialize(0)
-    from teleop.robot_control.robot_arm import H2_ArmController
-    logger.info("Initialising H2_ArmController...")
-    arm_ctrl = H2_ArmController(
-        kp_low=args.kp_low, kp_wrist=args.kp_wrist,
-        kd_low=args.kd_low, kd_wrist=args.kd_wrist,
-    )
-    logger.info("H2_ArmController ready.")
+    left_hand, right_hand = _setup_hands(args)
 
-    # ── image client ──────────────────────────────────────────────────────────
-    from teleimager.image_client import ImageClient
-    logger.info(f"Connecting to image server at {args.img_server_ip} ...")
-    img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-    cam_config = img_client.get_cam_config()
+    arm_ctrl = None
+    if args.arm:
+        from teleop.robot_control.robot_arm import H2_ArmController
+        logger.info(
+            f"Initialising H2_ArmController (motion_mode={args.motion}, "
+            f"head_pitch_home={args.head_pitch_home})..."
+        )
+        arm_ctrl = H2_ArmController(
+            motion_mode=args.motion,
+            head_pitch_home=args.head_pitch_home,
+            kp_low=args.kp_low, kp_wrist=args.kp_wrist,
+            kd_low=args.kd_low, kd_wrist=args.kd_wrist,
+        )
+        logger.info("H2_ArmController ready.")
+
+    img_client, cam_config = _make_image_client(args)
     logger.info(f"Camera config keys: {list(cam_config.keys())}")
+    _warm_cameras(img_client, timeout_s=args.cam_warmup_s)
 
-    # ── diagnose camera config ────────────────────────────────────────────────
-    logger.info("\n=== Camera config from image server ===")
-    for cam_name, cfg in cam_config.items():
-        logger.info(f"  {cam_name}: enable_zmq={cfg.get('enable_zmq')}  cfg={cfg}")
+    obs = get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                           cam_config, args.task,
+                           head_eye=args.head_eye,
+                           image_source=args.image_source)
 
-    # ── probe each camera directly before building obs ────────────────────────
-    cam_name_to_key = {
-        "head_camera":        "high",
-        "left_wrist_camera":  "left_wrist_view",
-        "right_wrist_camera": "right_wrist_view",
-    }
-    getter_map = {
-        "high":             img_client.get_head_frame,
-        "left_wrist_view":  img_client.get_left_wrist_frame,
-        "right_wrist_view": img_client.get_right_wrist_frame,
-    }
-    # Wait for ZMQ subscriber threads to receive the first frame from each camera.
-    # The ring buffer is empty immediately after subscribe() is called, so we
-    # poll until bgr is not None or the timeout expires.
-    _PROBE_TIMEOUT_S = 5.0
-    _PROBE_INTERVAL_S = 0.1
-
-    logger.info("\n=== Raw camera probe (waiting up to 5s per camera) ===")
-    for cam_name, cfg in cam_config.items():
-        key    = cam_name_to_key.get(cam_name)
-        getter = getter_map.get(key) if key else None
-        if getter is None:
-            logger.warning(f"  [{cam_name}] no getter — unknown camera name")
-            continue
-        if not cfg.get("enable_zmq"):
-            logger.warning(f"  [{cam_name}] enable_zmq=False — frame will be skipped")
-            continue
-
-        deadline = time.perf_counter() + _PROBE_TIMEOUT_S
-        frame = None
-        while time.perf_counter() < deadline:
-            frame = getter()
-            if frame is not None and frame.bgr is not None:
-                break
-            time.sleep(_PROBE_INTERVAL_S)
-
-        if frame is None:
-            logger.error(f"  [{key}] getter returned None after {_PROBE_TIMEOUT_S}s")
-        elif frame.bgr is None:
-            logger.error(f"  [{key}] frame.bgr still None after {_PROBE_TIMEOUT_S}s — "
-                         "image server may not be publishing")
-        else:
-            img = frame.bgr
-            logger.info(f"  [{key}] OK  shape={img.shape}  dtype={img.dtype}"
-                        f"  min={img.min()}  max={img.max()}")
-
-    # ── build full observation (cameras are now warmed up from the probe) ────
-    obs = get_observations(img_client, arm_ctrl, left_hand, right_hand, cam_config, args.task)
-
-    # ── print every field ─────────────────────────────────────────────────────
     def _print_nested(d: dict, prefix: str = ""):
         for k, v in d.items():
             path = f"{prefix}.{k}" if prefix else k
@@ -424,25 +519,22 @@ def check_observations(args):
     _print_nested(obs)
 
     if not obs.get("video"):
-        logger.error("video dict is EMPTY — no camera frames received. "
-                     "Check image server and enable_zmq settings above.")
+        logger.error("video dict is EMPTY — no camera frames received.")
 
-    # ── save camera snapshots ─────────────────────────────────────────────────
     logger.info("\n=== Camera snapshots ===")
     for key, arr in obs.get("video", {}).items():
-        # arr shape: (1, 1, H, W, 3) RGB uint8
-        img_rgb = arr[0, 0]
+        img_rgb = arr[0, 0]   # (1, 1, H, W, 3) → (H, W, 3) RGB
         img_bgr = img_rgb[:, :, ::-1].copy()
         save_path = f"/tmp/check_{key}.png"
         cv2.imwrite(save_path, img_bgr)
         logger.info(f"  [{key}] saved → {save_path}")
 
     logger.info("\nCheck complete.")
-
-    # ── cleanup to avoid segfault on exit ─────────────────────────────────────
-    if args.hands:
-        disconnect_hand(left_hand,  "left")
-        disconnect_hand(right_hand, "right")
+    _teardown_hands(args, left_hand, right_hand)
+    try:
+        img_client.close()
+    except Exception:
+        pass
 
 
 # ── main eval loop ─────────────────────────────────────────────────────────────
@@ -451,56 +543,37 @@ def eval_h2_groot(args):
     if args.check:
         check_observations(args)
         return
-    # ── hands ─────────────────────────────────────────────────────────────────
-    left_hand  = None
-    right_hand = None
-    if args.hands:
-        logger.info("Connecting left hand...")
-        left_hand  = connect_hand("left",  args.hand_speed_coeff, args.hand_current_coeff)
-        logger.info("Connecting right hand...")
-        right_hand = connect_hand("right", args.hand_speed_coeff, args.hand_current_coeff)
-        logger.info("Waiting for hands to reach neutral position...")
-        time.sleep(2.0)
 
-    # ── arm ───────────────────────────────────────────────────────────────────
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    ChannelFactoryInitialize(0)
-    from teleop.robot_control.robot_arm import H2_ArmController
-    logger.info("Initialising H2_ArmController...")
-    arm_ctrl = H2_ArmController(
-        kp_low=args.kp_low, kp_wrist=args.kp_wrist,
-        kd_low=args.kd_low, kd_wrist=args.kd_wrist,
-    )
-    arm_ctrl.speed_gradual_max()
-    logger.info("H2_ArmController ready.")
+    # DDS factory must be ready before any DDS publisher/subscriber is created
+    # (H2_ArmController and SharpaHandDDSClient both need this).
+    if args.arm or (args.hands and args.hands_source == "dds"):
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(args.dds_domain)
+        logger.info(f"DDS ChannelFactory initialised on domain {args.dds_domain}.")
 
-    # ── go home and hold 20s — gives Sharpa SDK time to fully start up ────────
-    _go_home(arm_ctrl, left_hand, right_hand, hold_s=20)
+    left_hand, right_hand = _setup_hands(args)
 
-    # ── image client ──────────────────────────────────────────────────────────
-    from teleimager.image_client import ImageClient
-    img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-    cam_config = img_client.get_cam_config()
+    arm_ctrl = None
+    if args.arm:
+        from teleop.robot_control.robot_arm import H2_ArmController
+        logger.info(
+            f"Initialising H2_ArmController (motion_mode={args.motion}, "
+            f"head_pitch_home={args.head_pitch_home})..."
+        )
+        arm_ctrl = H2_ArmController(
+            motion_mode=args.motion,
+            head_pitch_home=args.head_pitch_home,
+            kp_low=args.kp_low, kp_wrist=args.kp_wrist,
+            kd_low=args.kd_low, kd_wrist=args.kd_wrist,
+        )
+        arm_ctrl.speed_gradual_max()
+        logger.info("H2_ArmController ready.")
+
+    _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
+
+    img_client, cam_config = _make_image_client(args)
     logger.info(f"Camera config: {list(cam_config.keys())}")
-
-    # Trigger ZMQ subscriptions now so ring buffers are filled before inference.
-    # get_head/wrist_frame() starts the background thread on first call; poll
-    # until each camera returns a valid frame (typically one 33ms cycle at 30fps).
-    _getters = [img_client.get_head_frame, img_client.get_left_wrist_frame,
-                img_client.get_right_wrist_frame]
-    logger.info("Warming up cameras...")
-    deadline = time.perf_counter() + 5.0
-    warmed = set()
-    while len(warmed) < len(_getters) and time.perf_counter() < deadline:
-        for i, getter in enumerate(_getters):
-            if i in warmed:
-                continue
-            f = getter()
-            if f is not None and f.bgr is not None:
-                warmed.add(i)
-        if len(warmed) < len(_getters):
-            time.sleep(0.05)
-    logger.info(f"Cameras ready ({len(warmed)}/{len(_getters)} with valid frames).")
+    _warm_cameras(img_client, timeout_s=args.cam_warmup_s)
 
     # ── GR00T policy client ───────────────────────────────────────────────────
     logger.info(f"Connecting to GR00T server at {args.policy_host}:{args.policy_port} ...")
@@ -534,12 +607,12 @@ def eval_h2_groot(args):
 
             steps_executed = 0
             while steps_executed < args.steps:
-                # ── get action chunk from GR00T ───────────────────────────────
                 obs             = get_observations(img_client, arm_ctrl, left_hand, right_hand,
-                                                   cam_config, args.task)
+                                                   cam_config, args.task,
+                                                   head_eye=args.head_eye,
+                                                   image_source=args.image_source)
                 action_chunk, _ = client.get_action(obs)
 
-                # ── execute up to action_horizon steps, not past the step limit ─
                 chunk_len = action_chunk["left_arm"].shape[1] if "left_arm" in action_chunk else args.action_horizon
                 horizon   = min(args.action_horizon, chunk_len, args.steps - steps_executed)
 
@@ -555,11 +628,12 @@ def eval_h2_groot(args):
                     if args.hands:
                         if left_hand is not None and "left_hand" in action_chunk:
                             err = left_hand.set_joint_position(action_chunk["left_hand"][0][t].tolist(), False)
-                            if err.code != 0:
+                            # DDS client returns None; SDK returns Error obj.
+                            if err is not None and getattr(err, "code", 0) != 0:
                                 logger.warning(f"left hand error t={t}: {err.message}")
                         if right_hand is not None and "right_hand" in action_chunk:
                             err = right_hand.set_joint_position(action_chunk["right_hand"][0][t].tolist(), False)
-                            if err.code != 0:
+                            if err is not None and getattr(err, "code", 0) != 0:
                                 logger.warning(f"right hand error t={t}: {err.message}")
 
                     elapsed = time.perf_counter() - t0
@@ -569,15 +643,17 @@ def eval_h2_groot(args):
                 logger.info(f"chunk done ({horizon} steps), total={steps_executed}/{args.steps}")
 
             logger.info(f"Episode {episode} complete ({args.steps} steps). Going home...")
-            _go_home(arm_ctrl, left_hand, right_hand, hold_s=20)
+            _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
 
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
-        _go_home(arm_ctrl, left_hand, right_hand, hold_s=20)
-        if args.hands:
-            disconnect_hand(left_hand,  "left")
-            disconnect_hand(right_hand, "right")
+        _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
+        _teardown_hands(args, left_hand, right_hand)
+        try:
+            img_client.close()
+        except Exception:
+            pass
         logger.info("Done.")
 
 
@@ -597,9 +673,46 @@ def parse_args():
     ap.add_argument("--steps", type=int, default=30,
                     help="Total number of control steps to run before stopping (default: 30)")
 
+    # Hand and arm enable/disable
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--hands",    dest="hands", action="store_true",  default=True)
     g.add_argument("--no-hands", dest="hands", action="store_false")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--arm",      dest="arm",   action="store_true",  default=True)
+    g.add_argument("--no-arm",   dest="arm",   action="store_false")
+
+    # Image source: ROS 2 (default, four CycloneDDS topics) or legacy ZMQ teleimager.
+    ap.add_argument("--image-source", choices=["ros", "zmq"], default="ros",
+                    help="Camera source. 'ros' = 4 sensor_msgs/Image topics published by "
+                         "sensing_h2_ros_gstreamer; 'zmq' = legacy teleimager server. "
+                         "Default: ros.")
+    ap.add_argument("--head-eye", choices=["left", "right", "both"], default="left",
+                    help="Which head eye(s) to feed to the policy. 'left' or 'right' map to "
+                         "video.high; 'both' produces video.left_eye_view + video.right_eye_view. "
+                         "Default: left.")
+    ap.add_argument("--cam-warmup-s", type=float, default=5.0,
+                    help="How long to wait for the first frame from each camera (default: 5s).")
+
+    # Sharpa hands source: through the C++ DDS bridge on Thor or direct SDK locally.
+    ap.add_argument("--hands-source", choices=["dds", "sdk"], default="dds",
+                    help="How to drive Sharpa hands. 'dds' = publish HandCmd_ to "
+                         "rt/sharpa/{left,right}/cmd via sharpa_dds_bridge on Thor. "
+                         "'sdk' = direct Sharpa SDK locally (bridge must be stopped). "
+                         "Default: dds.")
+    ap.add_argument("--dds-domain", type=int, default=0,
+                    help="DDS domain ID for the arm controller and DDS-bridge hand client.")
+
+    # H2 motion mode for standing replay (publish to rt/arm_sdk so WBC yields arms).
+    ap.add_argument("--motion", action="store_true",
+                    help="Enable H2 motion mode (publish on rt/arm_sdk with handover weight=1). "
+                         "Required when the robot is standing on its legs.")
+    ap.add_argument("--head-pitch-home", type=float, default=0.6, metavar="RAD",
+                    help="H2 head pitch held during inference (radians). "
+                         "Range -0.523 (up) to 0.837 (down). Default: 0.6.")
+
+    # Hold timing
+    ap.add_argument("--hold-s", type=int, default=20,
+                    help="Seconds to hold at home before/between/after inference. Default: 20.")
 
     # H2 PD gains
     ap.add_argument("--kp-low",   type=float, default=None)
@@ -607,7 +720,7 @@ def parse_args():
     ap.add_argument("--kd-low",   type=float, default=None)
     ap.add_argument("--kd-wrist", type=float, default=None)
 
-    # Sharpa tuning
+    # Sharpa SDK tuning (only used when --hands-source sdk)
     ap.add_argument("--hand-speed-coeff",   type=float, default=0.5)
     ap.add_argument("--hand-current-coeff", type=float, default=0.6)
     return ap.parse_args()

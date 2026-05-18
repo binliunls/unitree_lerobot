@@ -8,6 +8,14 @@ class RobotConfig:
     camera_to_image_key: dict[str, str]
     json_state_data_name: list[str]
     json_action_data_name: list[str]
+    # Optional: per-fingertip tactile streams. Each entry is
+    #   (lerobot_feature_key, raw_json_hand_key, raw_json_finger_key)
+    # where the converter resolves to step["tactiles"][hand][finger]["deform"]
+    # (a path to a 240x240 uint8 grayscale PNG) and re-encodes the per-episode
+    # sequence into an MP4 stored under the lerobot feature key.
+    # Order matters: it must match SaTA's canonical finger order, because the
+    # SpatialAnchor positional embedding is indexed by position.
+    tactile_keys: tuple[tuple[str, str, str], ...] = ()
 
 
 Z1_CONFIG = RobotConfig(
@@ -576,6 +584,24 @@ H2_SHARPA_CONFIG = RobotConfig(
 )
 
 
+H2_SHARPA_TACTILE_CONFIG = dataclasses.replace(
+    H2_SHARPA_CONFIG,
+    tactile_keys=(
+        # (lerobot_feature_key,                hand_key, finger_name)
+        ("observation.tactile.left_thumb",     "left_ee",  "thumb"),
+        ("observation.tactile.left_index",     "left_ee",  "index"),
+        ("observation.tactile.left_middle",    "left_ee",  "middle"),
+        ("observation.tactile.left_ring",      "left_ee",  "ring"),
+        ("observation.tactile.left_pinky",     "left_ee",  "pinky"),
+        ("observation.tactile.right_thumb",    "right_ee", "thumb"),
+        ("observation.tactile.right_index",    "right_ee", "index"),
+        ("observation.tactile.right_middle",   "right_ee", "middle"),
+        ("observation.tactile.right_ring",     "right_ee", "ring"),
+        ("observation.tactile.right_pinky",    "right_ee", "pinky"),
+    ),
+)
+
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -590,4 +616,5 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_H2": H2_CONFIG,
     "Unitree_H2_Sharpa": H2_SHARPA_CONFIG,
+    "Unitree_H2_Sharpa_Tactile": H2_SHARPA_TACTILE_CONFIG,
 }

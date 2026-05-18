@@ -63,6 +63,7 @@ class JsonDataset:
         self.json_state_data_name = ROBOT_CONFIGS[robot_type].json_state_data_name
         self.json_action_data_name = ROBOT_CONFIGS[robot_type].json_action_data_name
         self.camera_to_image_key = ROBOT_CONFIGS[robot_type].camera_to_image_key
+        self.tactile_keys = ROBOT_CONFIGS[robot_type].tactile_keys
 
     def _init_paths(self) -> None:
         """Initialize episode and task paths."""
@@ -165,6 +166,41 @@ class JsonDataset:
 
         return images
 
+    def _parse_tactile(self, episode_path: str, episode_data) -> dict[str, list[np.ndarray]]:
+        """Load per-fingertip DEFORM PNGs into a dict keyed by lerobot feature name.
+
+        For each step in the episode, walks step["tactiles"][hand][finger]["deform"]
+        for every (lerobot_key, hand, finger) entry declared in tactile_keys, loads
+        the PNG as 240x240 uint8 grayscale, and stacks per-key. LeRobot's video
+        backend re-encodes each per-finger sequence into an MP4 at save time.
+        """
+        tactile = defaultdict(list)
+        if not self.tactile_keys or not episode_data.get("data"):
+            return tactile
+
+        for sample_data in episode_data["data"]:
+            tactiles = sample_data.get("tactiles") or {}
+            for lerobot_key, hand_key, finger_name in self.tactile_keys:
+                entry = (tactiles.get(hand_key) or {}).get(finger_name)
+                relative_path = entry.get("deform") if isinstance(entry, dict) else None
+                if not relative_path:
+                    continue
+
+                image_path = os.path.join(episode_path, relative_path)
+                if not os.path.exists(image_path):
+                    raise FileNotFoundError(f"Tactile path does not exist: {image_path}")
+
+                img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    raise RuntimeError(f"Failed to read tactile image: {image_path}")
+                # LeRobot's current image writer requires 3 channels. The signal is
+                # grayscale, so we triplicate into RGB — the encoder downstream can
+                # take channel 0 (or any one; all 3 are identical). MP4 codecs do
+                # YUV internally anyway, so the on-disk size cost is negligible.
+                tactile[lerobot_key].append(np.repeat(img[:, :, None], 3, axis=2))
+
+        return tactile
+
     def get_item(
         self,
         index: int | None = None,
@@ -187,6 +223,9 @@ class JsonDataset:
         # Load camera images
         cameras = self._parse_images(file_path, episode_data)
 
+        # Load tactile deformation maps (empty if robot config has no tactile_keys)
+        tactile = self._parse_tactile(file_path, episode_data)
+
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {
@@ -203,6 +242,7 @@ class JsonDataset:
             "state": state,
             "action": action,
             "cameras": cameras,
+            "tactile": tactile,
             "task": task,
             "data_cfg": data_cfg,
         }
@@ -266,6 +306,21 @@ def create_empty_dataset(
             ],
         }
 
+    # Per-fingertip tactile DEFORM streams (only present when the robot config
+    # declares tactile_keys, e.g. Unitree_H2_Sharpa_Tactile). Stored as 3-channel
+    # because LeRobot's image writer doesn't yet accept 1-channel; the underlying
+    # signal is grayscale and the three channels are identical.
+    for lerobot_key, _hand, _finger in ROBOT_CONFIGS[robot_type].tactile_keys:
+        features[lerobot_key] = {
+            "dtype": mode,
+            "shape": (240, 240, 3),
+            "names": [
+                "height",
+                "width",
+                "channel",
+            ],
+        }
+
     if Path(HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
@@ -297,6 +352,7 @@ def populate_dataset(
         state = episode["state"]
         action = episode["action"]
         cameras = episode["cameras"]
+        tactile = episode.get("tactile") or {}
         task = episode["task"]
         episode_length = episode["episode_length"]
 
@@ -313,6 +369,10 @@ def populate_dataset(
 
             for camera, img_array in cameras.items():
                 frame[f"observation.images.{camera}"] = img_array[i]
+
+            for tactile_key, frames in tactile.items():
+                if i < len(frames):
+                    frame[tactile_key] = frames[i]
 
             frame["task"] = task
 

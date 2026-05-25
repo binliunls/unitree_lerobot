@@ -843,11 +843,26 @@ def eval_h2_groot(args):
             # alpha == 1.0 -> raw action, no smoothing (backwards compatible).
             # smaller alpha -> heavier smoothing + slightly more lag.
             smooth_alpha = float(args.smooth_alpha)
+            boundary_alpha = float(args.boundary_smooth_alpha)
+            boundary_total = max(0, int(args.boundary_smooth_steps))
+            blend_total = max(0, int(args.boundary_blend_steps))
+            # alpha > 0 → exp(-alpha * t/N) decays. alpha <= 0 would give
+            # w_old >= 1 forever — clamp to a tiny positive.
+            blend_alpha = max(1e-6, float(args.boundary_blend_alpha))
             prev_left_arm = None
             prev_right_arm = None
             prev_left_hand = None
             prev_right_hand = None
             last_loaded_version = -1
+            # Counter — how many remaining boundary-smoothing ticks for the
+            # current chunk. Reset to boundary_total on every chunk switch.
+            boundary_remaining = 0
+            # Cross-chunk crossfade state: the just-finished chunk and the
+            # step index where it would have continued. Used to blend the
+            # old chunk's unexecuted future steps with the new chunk's first
+            # few steps (same wall-clock-time pairs).
+            prev_chunk = None
+            prev_chunk_next_t = 0
 
             steps_executed = 0
             while steps_executed < args.steps:
@@ -903,21 +918,80 @@ def eval_h2_groot(args):
                     )
                     continue
 
+                # New chunk just loaded → restart boundary-smoothing window.
+                # (Only meaningful if prev_* is set; the very first chunk has
+                # no anchor so EMA passes through raw values regardless.)
+                boundary_remaining = boundary_total
+
+                # Cross-chunk blend window: number of leading steps where we
+                # mix prev_chunk[prev_next_t + i] with action_chunk[start+i].
+                # Bounded by:
+                #   * blend_total (user-requested),
+                #   * prev chunk's unused future (chunk_A_len - prev_next_t),
+                #   * new chunk's available horizon.
+                if (blend_total > 0 and prev_chunk is not None
+                        and "left_arm" in prev_chunk):
+                    prev_chunk_len = prev_chunk["left_arm"].shape[1]
+                    old_remaining = max(0, prev_chunk_len - prev_chunk_next_t)
+                    blend_window = min(blend_total, old_remaining, horizon)
+                else:
+                    blend_window = 0
+
+                if blend_window > 0:
+                    # w_old at step 0 = 1.0 always; w_old at step N = exp(-alpha).
+                    # We report the value at the LAST included step (N-1).
+                    w_old_final = math.exp(-blend_alpha * (blend_window - 1) / blend_window)
+                    logger.info(
+                        f"boundary blend: {blend_window} steps "
+                        f"(old @ {prev_chunk_next_t}..{prev_chunk_next_t + blend_window - 1} "
+                        f"× new @ {start_step}..{start_step + blend_window - 1}, "
+                        f"alpha={blend_alpha:.2f}, "
+                        f"w_old: 1.000→{w_old_final:.3f})"
+                    )
+
                 # ── walk the chunk for `horizon` ticks (action_horizon or less) ──
                 for offset in range(horizon):
                     t = start_step + offset
                     t0 = time.perf_counter()
 
-                    raw_left_arm  = action_chunk["left_arm"][0][t].astype(np.float64)
-                    raw_right_arm = action_chunk["right_arm"][0][t].astype(np.float64)
+                    # Effective alpha for this tick — heavier blend right after
+                    # a chunk switch to hide the discontinuity between two
+                    # independently-sampled chunks; ramps back to user's
+                    # smooth_alpha once boundary_remaining hits 0.
+                    if boundary_remaining > 0:
+                        effective_alpha = boundary_alpha
+                        boundary_remaining -= 1
+                    else:
+                        effective_alpha = smooth_alpha
 
-                    if smooth_alpha < 1.0:
+                    # Build raw targets — either pure new chunk, or a linear
+                    # blend with the old chunk at the same wall-clock-time index.
+                    if offset < blend_window:
+                        old_t = prev_chunk_next_t + offset
+                        # w_new ramps from 1/N to N/N over the blend window:
+                        # old wins early, new wins late, clean handoff at the
+                        # end of the window (w_new == 1.0 for offset == N-1).
+                        # Exponential blend: w_old = exp(-alpha * t/N) where
+                        # t = offset, N = blend_window. Step 0 starts with
+                        # w_old=1.0 (pure old chunk) and decays toward
+                        # exp(-alpha) at step N.
+                        w_old = math.exp(-blend_alpha * offset / blend_window)
+                        w_new = 1.0 - w_old
+                        raw_left_arm  = (w_new * action_chunk["left_arm"][0][t].astype(np.float64)
+                                         + w_old * prev_chunk["left_arm"][0][old_t].astype(np.float64))
+                        raw_right_arm = (w_new * action_chunk["right_arm"][0][t].astype(np.float64)
+                                         + w_old * prev_chunk["right_arm"][0][old_t].astype(np.float64))
+                    else:
+                        raw_left_arm  = action_chunk["left_arm"][0][t].astype(np.float64)
+                        raw_right_arm = action_chunk["right_arm"][0][t].astype(np.float64)
+
+                    if effective_alpha < 1.0:
                         if prev_left_arm is None:
                             left_arm = raw_left_arm
                             right_arm = raw_right_arm
                         else:
-                            left_arm  = smooth_alpha * raw_left_arm  + (1.0 - smooth_alpha) * prev_left_arm
-                            right_arm = smooth_alpha * raw_right_arm + (1.0 - smooth_alpha) * prev_right_arm
+                            left_arm  = effective_alpha * raw_left_arm  + (1.0 - effective_alpha) * prev_left_arm
+                            right_arm = effective_alpha * raw_right_arm + (1.0 - effective_alpha) * prev_right_arm
                     else:
                         left_arm = raw_left_arm
                         right_arm = raw_right_arm
@@ -929,9 +1003,16 @@ def eval_h2_groot(args):
 
                     if args.hands:
                         if left_hand is not None and "left_hand" in action_chunk:
-                            raw_lh = np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64)
-                            if smooth_alpha < 1.0 and prev_left_hand is not None:
-                                lh = smooth_alpha * raw_lh + (1.0 - smooth_alpha) * prev_left_hand
+                            if offset < blend_window and "left_hand" in (prev_chunk or {}):
+                                old_t = prev_chunk_next_t + offset
+                                w_new = (offset + 1) / float(blend_window)
+                                w_old = 1.0 - w_new
+                                raw_lh = (w_new * np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64)
+                                          + w_old * np.asarray(prev_chunk["left_hand"][0][old_t], dtype=np.float64))
+                            else:
+                                raw_lh = np.asarray(action_chunk["left_hand"][0][t], dtype=np.float64)
+                            if effective_alpha < 1.0 and prev_left_hand is not None:
+                                lh = effective_alpha * raw_lh + (1.0 - effective_alpha) * prev_left_hand
                             else:
                                 lh = raw_lh
                             prev_left_hand = lh
@@ -940,9 +1021,16 @@ def eval_h2_groot(args):
                             if err is not None and getattr(err, "code", 0) != 0:
                                 logger.warning(f"left hand error t={t}: {err.message}")
                         if right_hand is not None and "right_hand" in action_chunk:
-                            raw_rh = np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64)
-                            if smooth_alpha < 1.0 and prev_right_hand is not None:
-                                rh = smooth_alpha * raw_rh + (1.0 - smooth_alpha) * prev_right_hand
+                            if offset < blend_window and "right_hand" in (prev_chunk or {}):
+                                old_t = prev_chunk_next_t + offset
+                                w_new = (offset + 1) / float(blend_window)
+                                w_old = 1.0 - w_new
+                                raw_rh = (w_new * np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64)
+                                          + w_old * np.asarray(prev_chunk["right_hand"][0][old_t], dtype=np.float64))
+                            else:
+                                raw_rh = np.asarray(action_chunk["right_hand"][0][t], dtype=np.float64)
+                            if effective_alpha < 1.0 and prev_right_hand is not None:
+                                rh = effective_alpha * raw_rh + (1.0 - effective_alpha) * prev_right_hand
                             else:
                                 rh = raw_rh
                             prev_right_hand = rh
@@ -958,6 +1046,13 @@ def eval_h2_groot(args):
                     f"chunk done ({horizon} steps from start_step={start_step}), "
                     f"total={steps_executed}/{args.steps}"
                 )
+
+                # Stash this chunk for cross-chunk blending at the next switch.
+                # prev_chunk_next_t is the step the chunk would have continued
+                # at if we hadn't switched (= start + horizon). Capped at
+                # chunk_len so old_remaining = 0 when we ran the whole chunk.
+                prev_chunk = action_chunk
+                prev_chunk_next_t = start_step + horizon
 
             # Episode complete — pause inference so we don't waste cycles
             # while the robot is going home.
@@ -1086,6 +1181,38 @@ def parse_args():
     ap.add_argument("--async-cache-poll-s", type=float, default=0.005,
                     help="How often the main loop polls for a fresh cached chunk "
                          "when blocked between chunks. Default: 5 ms.")
+
+    # Boundary smoothing — heavier EMA blend for the first few ticks after
+    # each chunk switch, to mask the discontinuity between two independently-
+    # sampled chunks (diffusion noise + slightly different observations).
+    # Default 1.0 / 0 steps = no boundary smoothing (matches old behavior).
+    ap.add_argument("--boundary-smooth-alpha", type=float, default=1.0,
+                    help="EMA alpha to use *only* during the first N ticks after "
+                         "a chunk switch (where N = --boundary-smooth-steps). "
+                         "Lower = stronger crossfade. Typical: 0.3.")
+    ap.add_argument("--boundary-smooth-steps", type=int, default=0,
+                    help="Number of consumer ticks at the start of each new chunk "
+                         "during which --boundary-smooth-alpha replaces "
+                         "--smooth-alpha. Typical: 3-6. 0 disables.")
+
+    # Boundary blend — chunk-pair crossfade using the OLD chunk's still-unused
+    # future steps. At a chunk switch, the two chunks' overlap steps describe
+    # predictions for the SAME wall-clock time, so we linearly blend them
+    # from "mostly old" → "mostly new" over N steps. Requires the model to
+    # produce chunks longer than the action_horizon (otherwise the old
+    # chunk has no unused future steps to blend with).
+    ap.add_argument("--boundary-blend-steps", type=int, default=0,
+                    help="Number of cross-chunk blend steps at each boundary. "
+                         "Pairs old chunk's unexecuted future steps with new "
+                         "chunk's leading steps and exponentially fades from "
+                         "old to new. Typical: 5-8. Requires "
+                         "chunk_len > action_horizon. 0 disables.")
+    ap.add_argument("--boundary-blend-alpha", type=float, default=2.0,
+                    help="Exponential decay rate for the cross-chunk blend. "
+                         "Per-step old-chunk weight: w_old(t) = exp(-alpha * t / N) "
+                         "where t is the step offset and N = --boundary-blend-steps. "
+                         "Step 0: w_old=1.0 (pure old chunk). Step N: w_old=exp(-alpha). "
+                         "Larger alpha → faster fade-out. Typical: 1.5-4.0. Default: 2.0.")
     return ap.parse_args()
 
 

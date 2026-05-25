@@ -66,6 +66,7 @@ import io
 import math
 import os
 import sys
+import threading
 import time
 
 import msgpack
@@ -172,6 +173,129 @@ class GR00TClient:
             self._ctx.term()
         except Exception:
             pass
+
+
+# ── Async policy worker (background inference) ───────────────────────────────
+#
+# Mirrors the isaac_ros leapp consumer protocol: the worker captures an
+# observation, queries the GR00T server, and caches (chunk, t_obs, version)
+# in a thread-safe slot. The main loop walks `action_horizon` ticks of the
+# current chunk, then at the boundary snapshots the latest cached chunk and
+# resumes execution from a *time-aligned* start_step so we skip the steps
+# of the new chunk that correspond to "the past."
+#
+# Only one thread owns the ZMQ socket. Reset between episodes is performed
+# inside the worker via `request_reset()` so the socket isn't touched from
+# the main thread.
+
+class AsyncPolicyWorker:
+    """Background producer for GR00T action chunks.
+
+    Capture cadence is whatever the server can sustain (inference is the
+    bottleneck). The main thread consumes the cache without blocking on
+    inference, achieving receding-horizon control with minimal idle time.
+    """
+
+    def __init__(self, client: GR00TClient, obs_fn, log_every: int = 30):
+        self._client = client
+        self._obs_fn = obs_fn        # () -> obs dict
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._pause.set()            # start paused
+        self._reset_request = threading.Event()
+        self._cache_lock = threading.Lock()
+        # (chunk_dict, t_obs_monotonic, version)
+        self._latest = None
+        self._version = 0
+        self._thread = None
+        self._infer_count = 0
+        self._log_every = log_every
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="async-policy-worker", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._pause.clear()  # wake from pause
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def pause(self):
+        """Stop producing new chunks (used during go_home / reset)."""
+        self._pause.set()
+
+    def resume(self):
+        """Resume producing. Drops any stale chunk from before the pause."""
+        with self._cache_lock:
+            self._latest = None
+        self._pause.clear()
+
+    def request_reset(self):
+        """Have the worker call client.reset() on its next loop iteration.
+
+        The ZMQ REQ socket is single-threaded; only the worker may touch it
+        once it's running. We signal here and wait for the worker to acknowledge.
+        """
+        self._reset_request.set()
+        # Block until the worker has cleared the flag (handled it).
+        deadline = time.monotonic() + 5.0
+        while self._reset_request.is_set():
+            if time.monotonic() > deadline or self._stop.is_set():
+                logger.warning("async worker: reset request timed out")
+                return
+            time.sleep(0.005)
+
+    def get_latest(self):
+        """Snapshot the latest cached chunk, or None if nothing cached yet.
+
+        Returns (chunk_dict, t_obs_monotonic, version) or None.
+        """
+        with self._cache_lock:
+            return self._latest
+
+    def _loop(self):
+        while not self._stop.is_set():
+            if self._pause.is_set():
+                # Even when paused, honour reset requests so they're not
+                # blocked behind the next resume().
+                if self._reset_request.is_set():
+                    try:
+                        self._client.reset()
+                    except Exception as e:
+                        logger.warning(f"async worker reset (paused) failed: {e}")
+                    self._reset_request.clear()
+                time.sleep(0.01)
+                continue
+            if self._reset_request.is_set():
+                try:
+                    self._client.reset()
+                except Exception as e:
+                    logger.warning(f"async worker reset failed: {e}")
+                self._reset_request.clear()
+                continue
+            t_obs = time.monotonic()
+            try:
+                obs = self._obs_fn()
+                chunk, _ = self._client.get_action(obs)
+            except Exception as e:
+                logger.warning(f"async inference iteration failed: {e}")
+                time.sleep(0.05)
+                continue
+            with self._cache_lock:
+                self._version += 1
+                self._latest = (chunk, t_obs, self._version)
+            self._infer_count += 1
+            if self._log_every > 0 and self._infer_count % self._log_every == 0:
+                logger.info(
+                    f"async worker: {self._infer_count} chunks cached "
+                    f"(latest version={self._version})"
+                )
 
 
 # ── Sharpa hand helpers (same as eval_h2.py) ──────────────────────────────────
@@ -680,15 +804,38 @@ def eval_h2_groot(args):
         return
 
     logger.info(f"Inference config: {args.frequency} Hz, "
-                f"action_horizon={args.action_horizon}, steps_per_episode={args.steps}, task='{args.task}'")
+                f"action_horizon={args.action_horizon}, steps_per_episode={args.steps}, "
+                f"task='{args.task}', async_policy={args.async_policy}")
     logger.info("Running: home(20s) → inference → home(20s) → inference → ...  Ctrl+C to stop.")
 
     dt       = 1.0 / args.frequency
+    step_dt  = dt  # the chunk's per-step time spacing matches the consumer rate
     episode  = 0
+
+    # ── optional async worker setup ───────────────────────────────────────────
+    worker = None
+    if args.async_policy:
+        def _obs_capture_fn():
+            return get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                                    cam_config, args.task,
+                                    head_eye=args.head_eye,
+                                    image_source=args.image_source,
+                                    swap_wrist_cams=args.swap_wrist_cams)
+        worker = AsyncPolicyWorker(client, _obs_capture_fn)
+        worker.start()
+        logger.info("Async policy worker started (paused).")
+
     try:
         while True:
             episode += 1
-            client.reset()
+            if worker is not None:
+                # Pause worker, reset policy via worker (sole socket owner),
+                # then resume so chunks start flowing again for this episode.
+                worker.pause()
+                worker.request_reset()
+                worker.resume()
+            else:
+                client.reset()
             logger.info(f"\n=== Episode {episode} ===")
 
             # EMA state on the per-step action targets. Smooths high-frequency
@@ -700,20 +847,65 @@ def eval_h2_groot(args):
             prev_right_arm = None
             prev_left_hand = None
             prev_right_hand = None
+            last_loaded_version = -1
 
             steps_executed = 0
             while steps_executed < args.steps:
-                obs             = get_observations(img_client, arm_ctrl, left_hand, right_hand,
-                                                   cam_config, args.task,
-                                                   head_eye=args.head_eye,
-                                                   image_source=args.image_source,
-                                                   swap_wrist_cams=args.swap_wrist_cams)
-                action_chunk, _ = client.get_action(obs)
+                # ── fetch next chunk ─────────────────────────────────────────
+                if worker is not None:
+                    # Wait for the worker to produce a chunk we haven't seen.
+                    # While waiting we hold the previous target via the arm
+                    # controller's internal latch (no new ctrl_dual_arm calls).
+                    wait_started = time.monotonic()
+                    while True:
+                        latest = worker.get_latest()
+                        if latest is not None and latest[2] > last_loaded_version:
+                            break
+                        if time.monotonic() - wait_started > 30.0:
+                            raise RuntimeError("Async worker produced no chunk in 30s.")
+                        time.sleep(args.async_cache_poll_s)
+                    action_chunk, t_obs, version = latest
+                    last_loaded_version = version
 
-                chunk_len = action_chunk["left_arm"].shape[1] if "left_arm" in action_chunk else args.action_horizon
-                horizon   = min(args.action_horizon, chunk_len, args.steps - steps_executed)
+                    chunk_len = (action_chunk["left_arm"].shape[1]
+                                 if "left_arm" in action_chunk else args.action_horizon)
 
-                for t in range(horizon):
+                    # Time-aligned start_step: skip the steps of the new chunk
+                    # whose intended execution time has already elapsed during
+                    # observation + inference latency.
+                    age = max(0.0, time.monotonic() - t_obs)
+                    start_step = int(age / step_dt)
+                    if start_step < 0:
+                        start_step = 0
+                    if start_step >= chunk_len:
+                        start_step = chunk_len - 1
+                else:
+                    # Sync mode — current behavior, observation + inference
+                    # blocks the loop here.
+                    obs = get_observations(img_client, arm_ctrl, left_hand, right_hand,
+                                           cam_config, args.task,
+                                           head_eye=args.head_eye,
+                                           image_source=args.image_source,
+                                           swap_wrist_cams=args.swap_wrist_cams)
+                    action_chunk, _ = client.get_action(obs)
+                    chunk_len = (action_chunk["left_arm"].shape[1]
+                                 if "left_arm" in action_chunk else args.action_horizon)
+                    start_step = 0
+
+                horizon = min(args.action_horizon,
+                              chunk_len - start_step,
+                              args.steps - steps_executed)
+                if horizon <= 0:
+                    # The latest cached chunk is so old that start_step is
+                    # already at the end. Drop it and try again next iter.
+                    logger.warning(
+                        f"chunk skipped: start_step={start_step} chunk_len={chunk_len}"
+                    )
+                    continue
+
+                # ── walk the chunk for `horizon` ticks (action_horizon or less) ──
+                for offset in range(horizon):
+                    t = start_step + offset
                     t0 = time.perf_counter()
 
                     raw_left_arm  = action_chunk["left_arm"][0][t].astype(np.float64)
@@ -762,7 +954,15 @@ def eval_h2_groot(args):
                     time.sleep(max(0.0, dt - elapsed))
                     steps_executed += 1
 
-                logger.info(f"chunk done ({horizon} steps), total={steps_executed}/{args.steps}")
+                logger.info(
+                    f"chunk done ({horizon} steps from start_step={start_step}), "
+                    f"total={steps_executed}/{args.steps}"
+                )
+
+            # Episode complete — pause inference so we don't waste cycles
+            # while the robot is going home.
+            if worker is not None:
+                worker.pause()
 
             logger.info(f"Episode {episode} complete ({args.steps} steps). Going home...")
             _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
@@ -773,6 +973,11 @@ def eval_h2_groot(args):
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception as e:
+                logger.warning(f"async worker stop failed: {e}")
         _go_home(arm_ctrl, left_hand, right_hand, hold_s=args.hold_s)
         _teardown_hands(args, left_hand, right_hand)
         try:
@@ -870,6 +1075,17 @@ def parse_args():
     # Sharpa SDK tuning (only used when --hands-source sdk)
     ap.add_argument("--hand-speed-coeff",   type=float, default=0.5)
     ap.add_argument("--hand-current-coeff", type=float, default=0.6)
+
+    # Async policy mode — run GR00T inference in a background thread so the
+    # robot keeps executing while the next chunk is being computed. At each
+    # chunk boundary, snap to the latest cached chunk and resume from a
+    # time-aligned start_step (skip steps that already elapsed during
+    # inference). Off by default to preserve the sync baseline.
+    ap.add_argument("--async-policy", action="store_true",
+                    help="Run GR00T inference concurrently with action execution.")
+    ap.add_argument("--async-cache-poll-s", type=float, default=0.005,
+                    help="How often the main loop polls for a fresh cached chunk "
+                         "when blocked between chunks. Default: 5 ms.")
     return ap.parse_args()
 
 

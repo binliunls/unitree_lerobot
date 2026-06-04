@@ -44,13 +44,21 @@ class DatasetConfig:
 DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 
+H2_WAIST_DATA_NAME = "body.qpos"
+H2_WAIST_MOTOR_NAMES = ["kWaistYaw", "kWaistRoll", "kWaistPitch"]
+
+
 class JsonDataset:
-    def __init__(self, data_dirs: Path, robot_type: str) -> None:
+    def __init__(self, data_dirs: Path, robot_type: str,
+                 include_waist_state: bool = False) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
 
         Args:
             data_dirs: Path to directory containing training data
+            include_waist_state: When True (H2 only), prepend "body.qpos" to the state path so
+                                 the LeRobot dataset includes the 3 waist joints in state only.
+                                 Action vector is unchanged.
         """
         assert data_dirs is not None, "Data directory cannot be None"
         assert robot_type is not None, "Robot type cannot be None"
@@ -60,9 +68,14 @@ class JsonDataset:
         # Initialize paths and cache
         self._init_paths()
         self._init_cache()
-        self.json_state_data_name = ROBOT_CONFIGS[robot_type].json_state_data_name
-        self.json_action_data_name = ROBOT_CONFIGS[robot_type].json_action_data_name
-        self.camera_to_image_key = ROBOT_CONFIGS[robot_type].camera_to_image_key
+        cfg = ROBOT_CONFIGS[robot_type]
+        # State path may be extended with body.qpos; action path stays as configured.
+        if include_waist_state and H2_WAIST_DATA_NAME not in cfg.json_state_data_name:
+            self.json_state_data_name = [H2_WAIST_DATA_NAME, *cfg.json_state_data_name]
+        else:
+            self.json_state_data_name = list(cfg.json_state_data_name)
+        self.json_action_data_name = list(cfg.json_action_data_name)
+        self.camera_to_image_key = cfg.camera_to_image_key
 
     def _init_paths(self) -> None:
         """Initialize episode and task paths."""
@@ -137,6 +150,8 @@ class JsonDataset:
 
         images = defaultdict(list)
 
+        if not episode_data.get("data"):
+            return images
         keys = episode_data["data"][0]["colors"].keys()
         cameras = [key for key in keys if "depth" not in key]
 
@@ -213,17 +228,23 @@ def create_empty_dataset(
     *,
     has_velocity: bool = False,
     has_effort: bool = False,
+    include_waist_state: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     motors = ROBOT_CONFIGS[robot_type].motors
     cameras = ROBOT_CONFIGS[robot_type].cameras
 
+    # State-side motors may be extended with the 3 H2 waist names; action stays as `motors`.
+    state_motors = motors
+    if include_waist_state and not all(n in motors for n in H2_WAIST_MOTOR_NAMES):
+        state_motors = [*H2_WAIST_MOTOR_NAMES, *motors]
+
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": (len(motors),),
+            "shape": (len(state_motors),),
             "names": [
-                motors,
+                state_motors,
             ],
         },
         "action": {
@@ -284,16 +305,24 @@ def populate_dataset(
     dataset: LeRobotDataset,
     raw_dir: Path,
     robot_type: str,
+    include_waist_state: bool = False,
 ) -> LeRobotDataset:
-    json_dataset = JsonDataset(raw_dir, robot_type)
+    json_dataset = JsonDataset(raw_dir, robot_type, include_waist_state=include_waist_state)
     for i in tqdm.tqdm(range(len(json_dataset))):
-        episode = json_dataset.get_item(i)
-
+        try:
+            episode = json_dataset.get_item(i)
+        except (IndexError, StopIteration, ValueError) as e:
+            print(f"  [skip] episode {i} unreadable ({type(e).__name__}: {e})")
+            continue
         state = episode["state"]
         action = episode["action"]
         cameras = episode["cameras"]
         task = episode["task"]
         episode_length = episode["episode_length"]
+
+        if episode_length == 0 or not cameras:
+            print(f"  [skip] episode {i} has no frames (data: 0, cameras: {bool(cameras)})")
+            continue
 
         num_frames = episode_length
         for i in range(num_frames):
@@ -320,6 +349,7 @@ def json_to_lerobot(
     *,
     push_to_hub: bool = False,
     mode: Literal["video", "image"] = "video",
+    include_waist_state: bool = False,  # H2 only: prepend body.qpos to STATE (not action).
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
     if (HF_LEROBOT_HOME / repo_id).exists():
@@ -331,12 +361,14 @@ def json_to_lerobot(
         mode=mode,
         has_effort=False,
         has_velocity=False,
+        include_waist_state=include_waist_state,
         dataset_config=dataset_config,
     )
     dataset = populate_dataset(
         dataset,
         raw_dir,
         robot_type=robot_type,
+        include_waist_state=include_waist_state,
     )
 
     if push_to_hub:

@@ -367,9 +367,7 @@ def create_empty_dataset(
         features["observation.tactile.force"] = {
             "dtype": "float32",
             "shape": (len(force_names),),
-            "names": [
-                force_names,
-            ],
+            "names": force_names,
         }
 
     if Path(HF_LEROBOT_HOME / repo_id).exists():

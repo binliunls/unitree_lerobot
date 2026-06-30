@@ -201,6 +201,34 @@ class JsonDataset:
 
         return tactile
 
+    def _parse_tactile_force(self, episode_data) -> np.ndarray:
+        """Load the per-fingertip 6-axis force (wrench) into a (T, 60) float32 array.
+
+        For each step, walks step["tactiles"][hand][finger]["f6"] for every
+        (lerobot_key, hand, finger) entry in tactile_keys IN THE SAME ORDER as
+        the deform maps, and concatenates the 6 raw f6 values per finger:
+        10 fingers x 6 axes = 60 values per frame. Axis order is the raw f6 order
+        (not reordered). Missing/empty f6 is zero-filled. Returns an empty array
+        when the robot config declares no tactile_keys.
+        """
+        if not self.tactile_keys or not episode_data.get("data"):
+            return np.zeros((0, 0), dtype=np.float32)
+
+        rows = []
+        for sample_data in episode_data["data"]:
+            tactiles = sample_data.get("tactiles") or {}
+            row = []
+            for _lerobot_key, hand_key, finger_name in self.tactile_keys:
+                entry = (tactiles.get(hand_key) or {}).get(finger_name)
+                f6 = entry.get("f6") if isinstance(entry, dict) else None
+                if isinstance(f6, list) and len(f6) == 6:
+                    row.extend(np.array(f6, dtype=np.float32))
+                else:
+                    row.extend([0.0] * 6)
+            rows.append(np.array(row, dtype=np.float32))
+
+        return np.array(rows, dtype=np.float32)
+
     def get_item(
         self,
         index: int | None = None,
@@ -226,6 +254,10 @@ class JsonDataset:
         # Load tactile deformation maps (empty if robot config has no tactile_keys)
         tactile = self._parse_tactile(file_path, episode_data)
 
+        # Load tactile 6-axis force (wrench): (T, 60) float32, finger order
+        # matching the deform keys; empty if robot config has no tactile_keys.
+        tactile_force = self._parse_tactile_force(episode_data)
+
         # Extract camera configuration
         cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {
@@ -243,6 +275,7 @@ class JsonDataset:
             "action": action,
             "cameras": cameras,
             "tactile": tactile,
+            "tactile_force": tactile_force,
             "task": task,
             "data_cfg": data_cfg,
         }
@@ -310,7 +343,8 @@ def create_empty_dataset(
     # declares tactile_keys, e.g. Unitree_H2_Sharpa_Tactile). Stored as 3-channel
     # because LeRobot's image writer doesn't yet accept 1-channel; the underlying
     # signal is grayscale and the three channels are identical.
-    for lerobot_key, _hand, _finger in ROBOT_CONFIGS[robot_type].tactile_keys:
+    tactile_keys = ROBOT_CONFIGS[robot_type].tactile_keys
+    for lerobot_key, _hand, _finger in tactile_keys:
         features[lerobot_key] = {
             "dtype": mode,
             "shape": (240, 240, 3),
@@ -318,6 +352,23 @@ def create_empty_dataset(
                 "height",
                 "width",
                 "channel",
+            ],
+        }
+
+    # Per-fingertip 6-axis force (wrench), concatenated into one numeric feature:
+    # 10 fingers x 6 axes = 60 float32 values per frame. Finger order matches the
+    # tactile deform keys above (left[thumb,index,middle,ring,pinky], then right);
+    # axis order is the raw f6 order. Kept as one (60,) vector for easy downstream
+    # windowing alongside the deform video streams.
+    if tactile_keys:
+        force_names = [f"{lerobot_key.rsplit('.', 1)[-1]}_f{axis}"
+                       for lerobot_key, _hand, _finger in tactile_keys
+                       for axis in range(6)]
+        features["observation.tactile.force"] = {
+            "dtype": "float32",
+            "shape": (len(force_names),),
+            "names": [
+                force_names,
             ],
         }
 
@@ -353,6 +404,7 @@ def populate_dataset(
         action = episode["action"]
         cameras = episode["cameras"]
         tactile = episode.get("tactile") or {}
+        tactile_force = episode.get("tactile_force")
         task = episode["task"]
         episode_length = episode["episode_length"]
 
@@ -373,6 +425,9 @@ def populate_dataset(
             for tactile_key, frames in tactile.items():
                 if i < len(frames):
                     frame[tactile_key] = frames[i]
+
+            if tactile_force is not None and i < len(tactile_force):
+                frame["observation.tactile.force"] = tactile_force[i]
 
             frame["task"] = task
 

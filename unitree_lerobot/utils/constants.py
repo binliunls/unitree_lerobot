@@ -602,6 +602,25 @@ H2_SHARPA_TACTILE_CONFIG = dataclasses.replace(
 )
 
 
+# 3-camera mono variant: teleop launched with --head-mode mono drops the
+# head/right stream, so recordings have color_{0,1,2} = head_left, wrist_left,
+# wrist_right (no head_right). Used when the Thor↔workstation link can't carry
+# 4 raw camera streams + tactile.
+H2_SHARPA_TACTILE_MONO_CONFIG = dataclasses.replace(
+    H2_SHARPA_TACTILE_CONFIG,
+    cameras=[
+        "cam_left_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ],
+    camera_to_image_key={
+        "color_0": "cam_left_high",
+        "color_1": "cam_left_wrist",
+        "color_2": "cam_right_wrist",
+    },
+)
+
+
 ROBOT_CONFIGS = {
     "Unitree_Z1_Single": Z1_SINGLE_CONFIG,
     "Unitree_Z1_Dual": Z1_CONFIG,
@@ -617,4 +636,5 @@ ROBOT_CONFIGS = {
     "Unitree_H2": H2_CONFIG,
     "Unitree_H2_Sharpa": H2_SHARPA_CONFIG,
     "Unitree_H2_Sharpa_Tactile": H2_SHARPA_TACTILE_CONFIG,
+    "Unitree_H2_Sharpa_Tactile_Mono": H2_SHARPA_TACTILE_MONO_CONFIG,
 }

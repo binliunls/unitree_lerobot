@@ -1,0 +1,3 @@
+gscam2:
+  ubuntu:
+    noble: [ros-jazzy-gscam2]

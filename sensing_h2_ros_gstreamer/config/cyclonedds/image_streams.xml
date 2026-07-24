@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+  <Domain Id="any">
+    <Internal>
+      <!-- Four image streams can arrive in bursts; request a larger UDP receive buffer. -->
+      <SocketReceiveBufferSize min="16MB" max="16MB"/>
+    </Internal>
+  </Domain>
+</CycloneDDS>

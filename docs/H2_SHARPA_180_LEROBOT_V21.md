@@ -218,3 +218,48 @@ cd /home/haochen/Projects_Haochen/unitree_lerobot
 /home/haochen/anaconda3/envs/teleop/bin/python -m unittest discover \
   -s test -p 'test_*h2_sharpa*.py'
 ```
+
+## Long conversions: batched driver (recommended for >~30 episodes)
+
+A single `convert_h2_sharpa_180_to_lerobot_v21` run over 100+ episodes dies intermittently
+after a few dozen episodes with impossible Python errors (wrong attribute name / wrong object
+inside a running loop): native-code heap corruption during LeRobot's per-episode save, root
+cause not isolated (pyarrow 22 vs the lock's pyarrow 21 is the main suspect). Three helpers in
+`unitree_lerobot/utils/` make conversion deterministic and training-ready:
+
+- `convert_h2_sharpa_180_batched.py` — same CLI as the converter plus `--batch-size`
+  (default 15) and `--max-retries`. Converts each batch in a fresh subprocess (through the
+  wrapper below), retries a failed batch, skips batches that already completed (so a killed
+  run resumes), then merges the batch datasets into ONE LeRobot v2.1 dataset: parquet
+  `episode_index`/`index` renumbered, videos and `native_tactile/` sidecars renamed
+  (`alignment.parquet` episode_index rewritten), `episodes.jsonl` / `episodes_stats.jsonl` /
+  `conversion.json` / `high_rate_tactile.json` renumbered, `info.json` totals recomputed,
+  `stats.json` re-aggregated with LeRobot's `aggregate_stats`, then quantiles added (below).
+  `--merge-only` re-merges existing batch outputs. Work dir: `.<output>.batches/` next to the
+  output; delete it after success.
+- `convert_h2_sharpa_180_ffmpeg_cli.py` — runs the converter with video encoding done by an
+  external `ffmpeg` process (same libsvtav1 / yuv420p / g=2 / crf=30 as LeRobot's in-process
+  PyAV path). Needs an ffmpeg with the `libsvtav1` encoder (the `teleop` conda env ships one;
+  override with `$LEROBOT_FFMPEG`).
+- `add_gr00t_stats_quantiles.py` — adds `q01`/`q99` for every float feature to
+  `meta/stats.json`. GR00T's `generate_stats` skips its (container-crashing) recomputation only
+  when those keys exist; LeRobot's aggregator never writes them. The batched driver calls this
+  automatically; run it by hand on any dataset whose `stats.json` lacks `q99`.
+
+```bash
+cd /path/to/unitree_lerobot
+export SHARPA_CAPTURE_TOOLS_DIR=/path/to/sharpa-teleop/thor/docker_5_0_1
+PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python -m unitree_lerobot.utils.convert_h2_sharpa_180_batched \
+  --raw-dir /path/to/datasets_H2_sharpa/<merged_task_dir> \
+  --output-dir /path/to/datasets_H2_sharpa_lerobot/<name>_180hz \
+  --repo-id <name>_180hz \
+  --task-description "open the medical bottle" \
+  --tactile-model-profile bimanual \
+  --native-storage-mode hardlink \
+  --batch-size 15 --max-retries 4
+```
+
+Run it in `tmux` (~35 s per episode). `--native-storage-mode hardlink` requires raw and output
+on the same filesystem. Validated on 135 episodes (2026-09-12): merged output structurally
+identical to a single-run dataset, content identical to the batch outputs, loads through
+GR00T's training data path for both tactile and vanilla configs.
